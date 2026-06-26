@@ -1,95 +1,177 @@
-# KWS SNN ESP32 — Hướng dẫn đầy đủ
+# KWS using RLIF-CSNN on ESP32
 
-## Sơ đồ nối dây
+## Overview
+
+Đây là dự án triển khai **Keyword Spotting (KWS)** trên nền tảng **ESP32** sử dụng **Convolutional Spiking Neural Network (CSNN)** kết hợp **Recurrent Leaky Integrate-and-Fire (RLIF)**.
+
+Mục tiêu của dự án là nghiên cứu khả năng triển khai mô hình Spiking Neural Network trên vi điều khiển có tài nguyên hạn chế, đồng thời xây dựng một hệ thống nhận dạng từ khóa hoạt động theo thời gian thực.
+
+Quy trình xử lý của hệ thống:
 
 ```
-INMP441          ESP32 DevKit V1
--------          ---------------
-VDD      →       3.3V
-GND      →       GND
-SCK      →       GPIO 26
-WS       →       GPIO 25
-SD       →       GPIO 33
-L/R      →       GND  (chọn kênh trái)
-
-LED 1 (on/off)   → GPIO 2  → 220Ω → GND
-LED 2 (left)     → GPIO 4  → 220Ω → GND
-LED 3 (right)    → GPIO 5  → 220Ω → GND
-LED 4 (go/stop)  → GPIO 18 → 220Ω → GND
-
-OLED SSD1306 (tùy chọn)
-SDA      →       GPIO 21
-SCL      →       GPIO 22
-VCC      →       3.3V
-GND      →       GND
+Speech
+    ↓
+INMP441 Microphone
+    ↓
+Log-Mel Spectrogram
+    ↓
+CNN Feature Extraction
+    ↓
+Spike Encoding
+    ↓
+RLIF-CSNN
+    ↓
+Keyword Prediction
+    ↓
+LED / OLED / Serial Monitor
 ```
 
-## Các bước thực hiện
+---
 
-### Bước 1: Train model trên PC
-```bash
-# Cài thư viện
-pip install torch torchaudio snntorch
+# Hardware
 
-# Copy các file sau vào 1 thư mục:
-#   config_tiny.py, dataset_tiny.py, model_tiny.py, train_tiny.py
+* ESP32 DevKit V1
+* INMP441 I2S Microphone
+* OLED SSD1306 (Optional)
+* 4 LEDs
+* USB Serial
 
-# Chạy training (~20-30 phút tùy CPU/GPU)
-python train_tiny.py
+---
 
-# Kết quả: checkpoints/tiny_best.pth
+# Training Phase (PC)
+
+Toàn bộ quá trình huấn luyện được thực hiện trên máy tính sử dụng **PyTorch** và **snnTorch**.
+
+Pipeline huấn luyện:
+
+```
+Google Speech Commands
+        ↓
+Log-Mel Spectrogram
+        ↓
+CNN Feature Extractor
+        ↓
+Spike Encoding
+        ↓
+RLIF-CSNN Training
+        ↓
+model.pth
+        ↓
+Quantization
+        ↓
+Export Weights (.h/.cpp)
 ```
 
-### Bước 2: Export sang C header
-```bash
-# Copy export_to_c.py vào cùng thư mục
-python export_to_c.py
+Sau khi mô hình hội tụ, các trọng số được lượng tử hóa và chuyển đổi sang file C Header để tích hợp vào firmware của ESP32.
 
-# Kết quả: model_weights.h (~80 KB)
+---
+
+# Deployment Phase (ESP32)
+
+ESP32 chỉ thực hiện **Inference**, không thực hiện quá trình huấn luyện.
+
+Pipeline xử lý trên ESP32:
+
+```
+INMP441
+    ↓
+I2S Driver
+    ↓
+PCM Audio Buffer
+    ↓
+compute_log_mel()
+    ↓
+run_cnn_features()
+    ↓
+rate_encode_feature()
+    ↓
+RLIF-CSNN Inference
+    ↓
+Keyword Prediction
+    ↓
+LED / OLED / Serial Monitor
 ```
 
-### Bước 3: Nạp firmware ESP32
-1. Mở Arduino IDE
-2. Cài board: ESP32 by Espressif Systems
-3. Chọn board: **ESP32 Dev Module**
-4. Copy `model_weights.h` vào thư mục `kws_esp32/`
-5. Nếu có OLED: cài thư viện Adafruit SSD1306, bỏ comment `#define USE_OLED`
-6. Upload sketch
+Kết quả dự đoán sẽ được:
 
-### Bước 4: Test
-Mở Serial Monitor (115200 baud), nói các keyword:
-- **"on"**   → LED 1 sáng
-- **"off"**  → LED 1 tắt
-- **"left"** → LED 2 toggle
-- **"right"**→ LED 3 toggle
-- **"go"**   → LED 4 sáng
-- **"stop"** → Tất cả tắt
+* Hiển thị trên Serial Monitor.
+* Điều khiển LED tương ứng với từ khóa.
+* Hiển thị trên OLED (nếu được bật).
 
-## Điều chỉnh nếu không nhận đúng
+---
 
-**VAD threshold** (dòng `#define VAD_THRESHOLD 500`):
-- Môi trường ồn → tăng lên 800-1000
-- Mic yếu, nói xa → giảm xuống 200-300
+# Repository Structure
 
-**Confidence threshold** (trong `run_snn_inference()`):
-- Dòng `if (spike_count[best] / total < 0.35f)` 
-- Tăng 0.35 → 0.45 nếu nhận nhầm nhiều
-- Giảm xuống 0.25 nếu không nhận ra
+```
+.
+├── checkpoints/
+│   └── tiny_best.pth                # Best trained model
+│
+├── image/                           # Results images
+│
+├── config_tiny.py                   # Hyperparameters
+├── dataset_tiny.py                  # Dataset loader
+├── model_tiny.py                    # RLIF-CSNN architecture
+├── train_tiny.py                    # Training script
+├── export_to_c.py                   # Convert model to C header
+├── model_weights.h                  # Quantized weights
+├── kws_esp32.ino                    # ESP32 inference firmware
+├── debug.py                         # Debug utilities
+├── README.md
+└── requirements.txt (optional)
+```
 
-**Debounce** (`#define DEBOUNCE_MS 800`):
-- Tăng nếu 1 lần nói bị nhận 2 lần
-- Giảm nếu muốn phản hồi nhanh hơn
+---
 
-## Ước tính tài nguyên
+# Experimental Results
 
-| Thứ | Kích thước |
-|-----|-----------|
-| Model weights (int8) | ~60 KB flash |
-| Audio buffer (1s)   | ~32 KB RAM   |
-| Conv output buffer  | ~4 KB RAM    |
-| Tổng RAM dùng       | ~80 KB / 520 KB |
+Qua quá trình thử nghiệm, mô hình RLIF-CSNN cho kết quả tốt hơn so với mô hình SNN hai lớp ban đầu.
 
-## Ghi chú
-- Inference time ước tính: 200-500ms trên ESP32 @ 240 MHz
-- Nếu quá chậm: giảm `TIME_STEPS = 5` trong config_tiny.py
-- Nếu accuracy thấp: tăng `EPOCHS = 50`, thêm data augmentation
+Một số cải tiến đã thực hiện:
+
+* Bổ sung CNN Feature Extractor trước lớp Spiking.
+* Thay neuron LIF bằng RLIF nhằm tăng khả năng khai thác thông tin theo thời gian.
+* Lượng tử hóa trọng số để phù hợp với bộ nhớ của ESP32.
+
+Mô hình đã có thể:
+
+* Thu âm trực tiếp từ INMP441.
+* Thực hiện suy luận trên ESP32.
+* Nhận dạng từ khóa và điều khiển LED theo kết quả dự đoán.
+* Xuất thông tin dự đoán qua Serial Monitor.
+
+---
+
+# Current Limitations
+
+Đây vẫn là phiên bản nghiên cứu và chưa phải hệ thống hoàn thiện.
+
+Một số hạn chế hiện tại:
+
+* Độ chính xác trên ESP32 còn thấp hơn so với khi chạy trên PC.
+* Mô hình vẫn cần tối ưu thêm về kích thước và thời gian suy luận.
+* Chưa đánh giá đầy đủ về độ trễ (Latency), năng lượng tiêu thụ và độ ổn định trong nhiều môi trường khác nhau.
+* Chưa triển khai các kỹ thuật tối ưu như Pruning hoặc Knowledge Distillation.
+* Chưa hỗ trợ cập nhật mô hình trực tiếp trên thiết bị.
+
+---
+
+# Future Work
+
+Trong các phiên bản tiếp theo, dự án sẽ tập trung vào:
+
+* Tối ưu kiến trúc RLIF-CSNN.
+* Giảm kích thước mô hình để phù hợp hơn với ESP32.
+* Cải thiện Accuracy và Latency.
+* Đánh giá mức tiêu thụ năng lượng trên thiết bị Edge.
+* Triển khai trên Raspberry Pi và FPGA để so sánh hiệu năng.
+* Phát triển giao diện hiển thị và hệ thống điều khiển hoàn chỉnh.
+
+---
+
+# Acknowledgements
+
+* PyTorch
+* snnTorch
+* Google Speech Commands Dataset
+* Espressif ESP32

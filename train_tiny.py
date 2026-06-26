@@ -1,7 +1,7 @@
 """
 train_tiny.py
 
-Pipeline đúng (sau khi sửa):
+Pipeline : 
   waveform (B,1,16000)
     → MelSpectrogram → squeeze → log → crop/pad → normalize(mean/std)
     → log_mel (B, MAX_LEN, N_MELS)

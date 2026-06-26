@@ -1,431 +1,416 @@
 /*
- * kws_esp32.ino — KWS RLIF trên ESP32 DevKit V1
- * RAM-optimized: không lưu pre_pool buffer đầy đủ
+ * kws_esp32.ino
+ * Keyword Spotting với SNN trên ESP32 DevKit V1
  *
- * Hardware:
- *   INMP441: SCK=26  WS=25  SD=33  L/R=GND
- *   LED on    : GPIO 2
- *   LED left  : GPIO 4
- *   LED right : GPIO 5
- *   OLED SSD1306: SDA=21  SCL=22
+ * Phần cứng:
+ *   INMP441  → I2S  (SCK=GPIO26, WS=GPIO25, SD=GPIO33)
+ *   LED 1    → GPIO2  (on/off)
+ *   LED 2    → GPIO4  (left)
+ *   LED 3    → GPIO5  (right)
+ *   OLED     → I2C   (SDA=GPIO21, SCL=GPIO22) - tùy chọn
+
+ * Sau khi train xong Python, chạy export_to_c.py
+ * rồi copy model_weights.h vào cùng thư mục này.
  */
 
 #include <driver/i2s.h>
 #include <math.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include "model_weights.h"
 
-// ── Pins ────────────────────────────────────────────────────
-#define PIN_I2S_SCK   26
-#define PIN_I2S_WS    25
-#define PIN_I2S_SD    33
-#define PIN_LED_ON     2
-#define PIN_LED_LEFT   4
-#define PIN_LED_RIGHT  5
+// #define USE_OLED
+#ifdef USE_OLED
+  #include <Wire.h>
+  #include <Adafruit_GFX.h>
+  #include <Adafruit_SSD1306.h>
+  Adafruit_SSD1306 display(128, 64, &Wire, -1);
+#endif
 
-// ── Audio ────────────────────────────────────────────────────
-#define SAMPLE_RATE   16000
-#define AUDIO_SAMPLES 16000
-#define N_FFT         400
-#define HOP_LENGTH    160
-#define MEL_FMIN      80.0f
-#define MEL_FMAX      7600.0f
+// Pin config
+#define I2S_SCK   26
+#define I2S_WS    25
+#define I2S_SD    33
 
-// ── Thresholds ───────────────────────────────────────────────
-#define VAD_THRESHOLD  600
-#define DEBOUNCE_MS    1500
-#define CONF_THRESHOLD 0.55f
+#define LED_ON    2    // keyword "on" / "off"
+#define LED_LEFT  4    // keyword "left"
+#define LED_RIGHT 5    // keyword "right"
+#define LED_GO    18   // keyword "go" / "stop"
 
-#define OLED_W 128
-#define OLED_H  64
+// Audio config
+#define SAMPLE_RATE    16000
+#define AUDIO_SAMPLES  16000   // 1 giây
+#define HOP_LENGTH     160
+#define N_FFT          400
+#define FRAME_COUNT    (AUDIO_SAMPLES / HOP_LENGTH)  // ~100 frames
 
-// ════════════════════════════════════════════════════════════
-// Static buffers — tính toán cẩn thận để không tràn DRAM
-//
-// audio_buf          : 16000×2        = 32 KB
-// mel_buf            : 64×40×4        = 10 KB
-// after_pool1        : 12×32×20×4     = 30 KB  (sau pool1)
-// after_pool2        : 24×16×10×4     = 15 KB  (sau pool2)
-// feat_buf           : 3840×4         = 15 KB
-// RLIF state         : (96+5)×4×4     =  1.5 KB
-// Tổng               : ~104 KB / 320 KB  ← OK
-//
-// Không lưu pre_pool (trước MaxPool) — tính trực tiếp
-// ════════════════════════════════════════════════════════════
+//VAD
+#define VAD_THRESHOLD  500     // Điều chỉnh tùy mic và môi trường
+#define DEBOUNCE_MS    800     // Không nhận lệnh liên tiếp quá nhanh
 
-static int16_t audio_buf[AUDIO_SAMPLES];              // 32 KB
-static float   mel_buf[KWS_MAX_LEN][KWS_N_MELS];     // 10 KB
+// Buffers
+int16_t audio_buf[AUDIO_SAMPLES];
+float   mel_buf[KWS_MAX_LEN][KWS_N_MELS];
 
-// Sau MaxPool1: int16_t (scale ×128) tiết kiệm 15 KB so với float
-static int16_t pool1_out[KWS_CONV1_CH]
-                        [KWS_CONV1_OUT_H]
-                        [KWS_CONV1_OUT_W];            // 15 KB
+// SNN state
+float mem1[64];   // membrane potential lif1
+float mem2[KWS_NUM_CLASSES];  // membrane potential lif2
+float spike_count[KWS_NUM_CLASSES];
 
-// Sau MaxPool2: int16_t tiết kiệm 8 KB
-static int16_t pool2_out[KWS_CONV2_CH]
-                        [KWS_CONV2_OUT_H]
-                        [KWS_CONV2_OUT_W];            //  8 KB
-
-static float feat_buf[KWS_FLATTEN_SIZE];              // 15 KB
-
-// RLIF state
-static float mem1[KWS_FC1_UNITS];
-static float mem2[KWS_NUM_CLASSES];
-static float spk1[KWS_FC1_UNITS];
-static float spk2[KWS_NUM_CLASSES];
-static float mem2_sum[KWS_NUM_CLASSES];
-static float fc1_out[KWS_FC1_UNITS];
-
-static Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
-static bool oled_ok = false;
-static bool led_on_state = false, led_left_state = false, led_right_state = false;
-
-// ── Helpers ──────────────────────────────────────────────────
-static inline float deq(uint8_t q, float scale, int zp) {
-    return (float)(q - zp) * scale;
+// Dequantize helper
+inline float deq(uint8_t q, float scale, int zp) {
+  return (q - zp) * scale;
 }
-static inline float rlif(float input, float *mem, float beta, float thresh) {
-    *mem = beta * (*mem) + input;
-    if (*mem >= thresh) { *mem -= thresh; return 1.0f; }
-    return 0.0f;
-}
-static inline float hz2mel(float hz) { return 2595.0f * log10f(1.0f + hz/700.0f); }
-static inline float mel2hz(float mel) { return 700.0f * (powf(10.0f, mel/2595.0f) - 1.0f); }
 
-// ════════════════════════════════════════════════════════════
-// 1. MEL SPECTROGRAM
-// ════════════════════════════════════════════════════════════
+// Forward pass (inference thủ công) 
+// Conv2D: 1 channel in, 8 channel out, kernel 3x3, same padding
+// Input: mel_buf[MAX_LEN][N_MELS]
+// Output: conv_out[8][MAX_LEN/2][N_MELS/2] (sau pool)
+#define CONV_OUT_H (KWS_MAX_LEN / 2)
+#define CONV_OUT_W (KWS_N_MELS  / 2)
+#define CONV_CH    8
+#define FC1_OUT    64
+
+float conv_out[CONV_CH][CONV_OUT_H][CONV_OUT_W];
+float fc1_out[FC1_OUT];
+float fc2_out[KWS_NUM_CLASSES];
+
+void run_conv_bn_pool() {
+  // Conv 3x3 same padding + BN + ReLU + MaxPool 2x2
+  float tmp[CONV_CH][KWS_MAX_LEN][KWS_N_MELS];
+
+  for (int c = 0; c < CONV_CH; c++) {
+    // Dequantize BN params
+    float bn_w = deq(bn1_weight[c], bn1_weight_scale, bn1_weight_zp);
+    float bn_b = deq(bn1_bias[c],   bn1_bias_scale,   bn1_bias_zp);
+    float bn_m = deq(bn1_mean[c],   bn1_mean_scale,   bn1_mean_zp);
+    float bn_v = deq(bn1_var[c],    bn1_var_scale,    bn1_var_zp);
+    float bn_std = sqrtf(bn_v + 1e-5f);
+
+    for (int h = 0; h < KWS_MAX_LEN; h++) {
+      for (int w = 0; w < KWS_N_MELS; w++) {
+        float val = 0;
+        // kernel 3x3
+        for (int kh = -1; kh <= 1; kh++) {
+          for (int kw = -1; kw <= 1; kw++) {
+            int ih = h + kh, iw = w + kw;
+            if (ih < 0 || ih >= KWS_MAX_LEN || iw < 0 || iw >= KWS_N_MELS) continue;
+            // weight index: [out_ch, in_ch=0, kh+1, kw+1] → flat
+            int widx = c * 9 + (kh + 1) * 3 + (kw + 1);
+            float wval = deq(conv1_weight[widx], conv1_weight_scale, conv1_weight_zp);
+            val += wval * mel_buf[ih][iw];
+          }
+        }
+        float bval = deq(conv1_bias[c], conv1_bias_scale, conv1_bias_zp);
+        val += bval;
+        // BatchNorm
+        val = (val - bn_m) / bn_std * bn_w + bn_b;
+        // ReLU
+        tmp[c][h][w] = val > 0 ? val : 0;
+      }
+    }
+  }
+
+  // MaxPool 2x2
+  for (int c = 0; c < CONV_CH; c++) {
+    for (int h = 0; h < CONV_OUT_H; h++) {
+      for (int w = 0; w < CONV_OUT_W; w++) {
+        float m = -1e9;
+        for (int ph = 0; ph < 2; ph++)
+          for (int pw = 0; pw < 2; pw++)
+            m = fmaxf(m, tmp[c][h*2+ph][w*2+pw]);
+        conv_out[c][h][w] = m;
+      }
+    }
+  }
+}
+
+// LIF neuron: returns spike (0/1), updates mem in-place
+inline float lif_step(float input, float *mem) {
+  *mem = LIF_BETA * (*mem) + input;
+  if (*mem >= 1.0f) { *mem -= 1.0f; return 1.0f; }
+  return 0.0f;
+}
+
+int run_snn_inference() {
+  // Reset state
+  memset(mem1, 0, sizeof(mem1));
+  memset(mem2, 0, sizeof(mem2));
+  memset(spike_count, 0, sizeof(spike_count));
+
+  int flat_size = CONV_CH * CONV_OUT_H * CONV_OUT_W;
+
+  for (int t = 0; t < KWS_TIME_STEPS; t++) {
+    // Rate encoding: spike nếu rand() < mel_buf[pixel]
+    // (dùng conv_out đã tính 1 lần, encode theo thời gian)
+
+    // FC1
+    for (int j = 0; j < FC1_OUT; j++) {
+      float sum = deq(fc1_bias[j], fc1_bias_scale, fc1_bias_zp);
+      int flat_idx = 0;
+      for (int c = 0; c < CONV_CH; c++)
+        for (int h = 0; h < CONV_OUT_H; h++)
+          for (int w = 0; w < CONV_OUT_W; w++, flat_idx++) {
+            // Rate encode: spike với xác suất = conv_out (đã normalize [0,1])
+            float prob = conv_out[c][h][w];
+            float spike = ((float)rand() / RAND_MAX < prob) ? 1.0f : 0.0f;
+            float wval = deq(fc1_weight[j * flat_size + flat_idx],
+                             fc1_weight_scale, fc1_weight_zp);
+            sum += wval * spike;
+          }
+      fc1_out[j] = lif_step(sum, &mem1[j]);
+    }
+
+    // FC2
+    for (int k = 0; k < KWS_NUM_CLASSES; k++) {
+      float sum = deq(fc2_bias[k], fc2_bias_scale, fc2_bias_zp);
+      for (int j = 0; j < FC1_OUT; j++) {
+        float wval = deq(fc2_weight[k * FC1_OUT + j],
+                         fc2_weight_scale, fc2_weight_zp);
+        sum += wval * fc1_out[j];
+      }
+      float spk = lif_step(sum, &mem2[k]);
+      spike_count[k] += spk;
+    }
+  }
+
+  // Argmax
+  int best = 0;
+  for (int k = 1; k < KWS_NUM_CLASSES; k++)
+    if (spike_count[k] > spike_count[best]) best = k;
+
+  // Confidence check: tổng spike phải đủ lớn
+  float total = 0;
+  for (int k = 0; k < KWS_NUM_CLASSES; k++) total += spike_count[k];
+  if (total < 2.0f) return -1;  // không đủ tự tin
+  if (spike_count[best] / total < 0.35f) return -1;
+
+  return best;
+}
+
+//Feature extraction: waveform → Log-Mel
+
+// Mel frequency helpers
+float hz_to_mel(float hz)  { return 2595.0f * log10f(1.0f + hz / 700.0f); }
+float mel_to_hz(float mel) { return 700.0f * (powf(10.0f, mel / 2595.0f) - 1.0f); }
+
 void compute_log_mel() {
-    const float mel_min = hz2mel(MEL_FMIN);
-    const float mel_max = hz2mel(MEL_FMAX);
-    float sum = 0.0f; int cnt = 0;
+  float mel_min = hz_to_mel(80.0f);
+  float mel_max = hz_to_mel(7600.0f);
 
-    for (int fr = 0; fr < KWS_MAX_LEN; fr++) {
-        int start = fr * HOP_LENGTH;
-        for (int m = 0; m < KWS_N_MELS; m++) {
-            if (start + N_FFT > AUDIO_SAMPLES) { mel_buf[fr][m] = 0.0f; continue; }
-            float f_c   = mel2hz(mel_min + (m+0.5f)*(mel_max-mel_min)/KWS_N_MELS);
-            float omega = 2.0f*(float)M_PI*f_c/SAMPLE_RATE;
-            float coeff = 2.0f*cosf(omega);
-            float s1=0,s2=0;
-            for (int n = 0; n < N_FFT; n++) {
-                float win = 0.5f*(1.0f-cosf(2.0f*(float)M_PI*n/(N_FFT-1)));
-                float s   = (audio_buf[start+n]/32768.0f)*win;
-                float s0  = coeff*s1-s2+s; s2=s1; s1=s0;
-            }
-            mel_buf[fr][m] = logf(s1*s1+s2*s2-coeff*s1*s2+1e-9f);
-            sum += mel_buf[fr][m]; cnt++;
-        }
+  float mean_val = 0, std_val = 0;
+  int count = 0;
+
+  for (int frame = 0; frame < KWS_MAX_LEN; frame++) {
+    int start = frame * HOP_LENGTH;
+    if (start + N_FFT > AUDIO_SAMPLES) break;
+
+    for (int m = 0; m < KWS_N_MELS; m++) {
+      // Tần số trung tâm của mel band m
+      float mel_center = mel_min + (m + 0.5f) * (mel_max - mel_min) / KWS_N_MELS;
+      float f_center   = mel_to_hz(mel_center);
+
+      // Goertzel algorithm — tính năng lượng tại tần số f_center
+      float omega = 2.0f * M_PI * f_center / SAMPLE_RATE;
+      float coeff = 2.0f * cosf(omega);
+      float s0 = 0, s1 = 0, s2 = 0;
+
+      for (int n = 0; n < N_FFT; n++) {
+        float sample = audio_buf[start + n] / 32768.0f;
+        // Hann window
+        float win = 0.5f * (1.0f - cosf(2.0f * M_PI * n / (N_FFT - 1)));
+        s0 = coeff * s1 - s2 + sample * win;
+        s2 = s1; s1 = s0;
+      }
+      float power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+      mel_buf[frame][m] = logf(power + 1e-9f);
+      mean_val += mel_buf[frame][m];
+      count++;
     }
-    float mean = sum/cnt, var=0;
-    for (int i=0;i<KWS_MAX_LEN;i++) for(int j=0;j<KWS_N_MELS;j++) var+=(mel_buf[i][j]-mean)*(mel_buf[i][j]-mean);
-    float inv_std = 1.0f/sqrtf(var/cnt+1e-9f);
-    for (int i=0;i<KWS_MAX_LEN;i++) for(int j=0;j<KWS_N_MELS;j++) mel_buf[i][j]=(mel_buf[i][j]-mean)*inv_std;
+  }
+
+  // Normalize
+  mean_val /= count;
+  for (int i = 0; i < KWS_MAX_LEN; i++)
+    for (int j = 0; j < KWS_N_MELS; j++)
+      std_val += (mel_buf[i][j] - mean_val) * (mel_buf[i][j] - mean_val);
+  std_val = sqrtf(std_val / count + 1e-9f);
+
+  for (int i = 0; i < KWS_MAX_LEN; i++)
+    for (int j = 0; j < KWS_N_MELS; j++)
+      mel_buf[i][j] = (mel_buf[i][j] - mean_val) / std_val;
+
+  // Normalize conv_out sang [0,1] cho rate encoding
+  run_conv_bn_pool();
+  float cmax = 0;
+  for (int c = 0; c < CONV_CH; c++)
+    for (int h = 0; h < CONV_OUT_H; h++)
+      for (int w = 0; w < CONV_OUT_W; w++)
+        cmax = fmaxf(cmax, conv_out[c][h][w]);
+  if (cmax > 0)
+    for (int c = 0; c < CONV_CH; c++)
+      for (int h = 0; h < CONV_OUT_H; h++)
+        for (int w = 0; w < CONV_OUT_W; w++)
+          conv_out[c][h][w] /= cmax;
 }
 
-// ════════════════════════════════════════════════════════════
-// 2. CNN: mel_buf → feat_buf
-//    Tính MaxPool trực tiếp: với mỗi output cell (oh,ow),
-//    tính conv trên 2×2 input cells rồi lấy max — không cần
-//    lưu toàn bộ pre_pool buffer.
-// ════════════════════════════════════════════════════════════
-void run_cnn_features() {
-
-    // ── Conv1 + BN1 + ReLU + MaxPool ──────────────────────
-    for (int oc = 0; oc < KWS_CONV1_CH; oc++) {
-        float bnW   = deq(bn1_weight[oc], bn1_weight_scale, bn1_weight_zp);
-        float bnB   = deq(bn1_bias[oc],   bn1_bias_scale,   bn1_bias_zp);
-        float bnM   = deq(bn1_mean[oc],   bn1_mean_scale,   bn1_mean_zp);
-        float bnStd = sqrtf(deq(bn1_var[oc], bn1_var_scale, bn1_var_zp) + 1e-5f);
-
-        for (int oh = 0; oh < KWS_CONV1_OUT_H; oh++) {
-            for (int ow = 0; ow < KWS_CONV1_OUT_W; ow++) {
-                float mx = -1e9f;
-                // MaxPool 2×2: duyệt qua 4 pre-pool cells
-                for (int ph = 0; ph < 2; ph++) {
-                    for (int pw = 0; pw < 2; pw++) {
-                        int h = oh*2 + ph;
-                        int w = ow*2 + pw;
-                        float val = deq(conv1_bias[oc], conv1_bias_scale, conv1_bias_zp);
-                        for (int kh=-1; kh<=1; kh++) {
-                            int ih = h+kh;
-                            if (ih<0||ih>=KWS_MAX_LEN) continue;
-                            for (int kw=-1; kw<=1; kw++) {
-                                int iw = w+kw;
-                                if (iw<0||iw>=KWS_N_MELS) continue;
-                                val += deq(conv1_weight[oc*9+(kh+1)*3+(kw+1)],
-                                           conv1_weight_scale, conv1_weight_zp)
-                                       * mel_buf[ih][iw];
-                            }
-                        }
-                        // BN + ReLU
-                        val = (val - bnM) / bnStd * bnW + bnB;
-                        if (val < 0) val = 0;
-                        if (val > mx) mx = val;
-                    }
-                }
-                // Lưu dạng int16: scale ×128, clamp [-256, 255]
-                pool1_out[oc][oh][ow] = (int16_t)fmaxf(-32768.0f, fminf(32767.0f, mx * 128.0f));
-            }
-        }
-    }
-
-    // ── Conv2 + BN2 + ReLU + MaxPool ──────────────────────
-    for (int oc = 0; oc < KWS_CONV2_CH; oc++) {
-        float bnW   = deq(bn2_weight[oc], bn2_weight_scale, bn2_weight_zp);
-        float bnB   = deq(bn2_bias[oc],   bn2_bias_scale,   bn2_bias_zp);
-        float bnM   = deq(bn2_mean[oc],   bn2_mean_scale,   bn2_mean_zp);
-        float bnStd = sqrtf(deq(bn2_var[oc], bn2_var_scale, bn2_var_zp) + 1e-5f);
-
-        for (int oh = 0; oh < KWS_CONV2_OUT_H; oh++) {
-            for (int ow = 0; ow < KWS_CONV2_OUT_W; ow++) {
-                float mx = -1e9f;
-                for (int ph = 0; ph < 2; ph++) {
-                    for (int pw = 0; pw < 2; pw++) {
-                        int h = oh*2+ph, w = ow*2+pw;
-                        float val = deq(conv2_bias[oc], conv2_bias_scale, conv2_bias_zp);
-                        for (int ic=0; ic<KWS_CONV1_CH; ic++) {
-                            for (int kh=-1; kh<=1; kh++) {
-                                int ih = h+kh;
-                                if (ih<0||ih>=KWS_CONV1_OUT_H) continue;
-                                for (int kw=-1; kw<=1; kw++) {
-                                    int iw = w+kw;
-                                    if (iw<0||iw>=KWS_CONV1_OUT_W) continue;
-                                    val += deq(conv2_weight[oc*(KWS_CONV1_CH*9)+ic*9+(kh+1)*3+(kw+1)],
-                                               conv2_weight_scale, conv2_weight_zp)
-                                           * (pool1_out[ic][ih][iw] / 128.0f);
-                                }
-                            }
-                        }
-                        val = (val - bnM) / bnStd * bnW + bnB;
-                        if (val < 0) val = 0;
-                        if (val > mx) mx = val;
-                    }
-                }
-                pool2_out[oc][oh][ow] = (int16_t)fmaxf(-32768.0f, fminf(32767.0f, mx * 256.0f));
-            }
-        }
-    }
-
-    // ── Flatten + Normalize [0,1] ──────────────────────────
-    int idx = 0;
-    for (int c=0;c<KWS_CONV2_CH;c++)
-        for (int h=0;h<KWS_CONV2_OUT_H;h++)
-            for (int w=0;w<KWS_CONV2_OUT_W;w++)
-                feat_buf[idx++] = pool2_out[c][h][w] / 256.0f;
-
-    float fmax = 0;
-    for (int i=0;i<KWS_FLATTEN_SIZE;i++) if(feat_buf[i]>fmax) fmax=feat_buf[i];
-    if (fmax > 1e-9f) { float inv=1.0f/fmax; for(int i=0;i<KWS_FLATTEN_SIZE;i++) feat_buf[i]*=inv; }
-}
-
-// ════════════════════════════════════════════════════════════
-// 3. RLIF INFERENCE
-// ════════════════════════════════════════════════════════════
-int run_rlif_inference() {
-    memset(mem1,0,sizeof(mem1)); memset(mem2,0,sizeof(mem2));
-    memset(spk1,0,sizeof(spk1)); memset(spk2,0,sizeof(spk2));
-    memset(mem2_sum,0,sizeof(mem2_sum));
-
-    for (int t = 0; t < KWS_TIME_STEPS; t++) {
-        // FC1 + Recurrent1 + RLIF1
-        for (int j=0; j<KWS_FC1_UNITS; j++) {
-            float cur = deq(fc1_bias[j], fc1_bias_scale, fc1_bias_zp);
-            for (int i=0;i<KWS_FLATTEN_SIZE;i++)
-                cur += deq(fc1_weight[j*KWS_FLATTEN_SIZE+i], fc1_weight_scale, fc1_weight_zp) * feat_buf[i];
-            float rec = deq(rlif1_rec_bias[j], rlif1_rec_bias_scale, rlif1_rec_bias_zp);
-            for (int k=0;k<KWS_FC1_UNITS;k++)
-                if (spk1[k]>0.5f)
-                    rec += deq(rlif1_rec_weight[j*KWS_FC1_UNITS+k], rlif1_rec_weight_scale, rlif1_rec_weight_zp);
-            fc1_out[j] = rlif(cur+rec, &mem1[j], RLIF1_BETA, RLIF1_THRESHOLD);
-        }
-        memcpy(spk1, fc1_out, sizeof(spk1));
-
-        // FC2 + Recurrent2 elementwise + RLIF2
-        for (int k=0; k<KWS_NUM_CLASSES; k++) {
-            float cur = deq(fc2_bias[k], fc2_bias_scale, fc2_bias_zp);
-            for (int j=0;j<KWS_FC1_UNITS;j++)
-                if (fc1_out[j]>0.5f)
-                    cur += deq(fc2_weight[k*KWS_FC1_UNITS+j], fc2_weight_scale, fc2_weight_zp);
-            float rec = deq(rlif2_V[0], rlif2_V_scale, rlif2_V_zp) * spk2[k];
-            spk2[k]    = rlif(cur+rec, &mem2[k], RLIF2_BETA, RLIF2_THRESHOLD);
-            mem2_sum[k] += mem2[k];
-        }
-    }
-
-    int best = 0;
-    for (int k=1;k<KWS_NUM_CLASSES;k++) if(mem2_sum[k]>mem2_sum[best]) best=k;
-    float total=0;
-    for (int k=0;k<KWS_NUM_CLASSES;k++) if(mem2_sum[k]>0) total+=mem2_sum[k];
-    if (total<1e-6f) return -1;
-    if (mem2_sum[best]/total < CONF_THRESHOLD) return -1;
-    if (strcmp(KWS_LABELS[best],"unknown")==0) return -1;
-    return best;
-}
-
-// ════════════════════════════════════════════════════════════
-// VAD
-// ════════════════════════════════════════════════════════════
+// ── VAD: kiểm tra có tiếng nói không ──────────────────────
 bool vad_detected() {
   long sum = 0;
   for (int i = 0; i < AUDIO_SAMPLES; i++)
-    sum += abs(audio_buf[i]); 
-  
-  long avg = sum / AUDIO_SAMPLES;
-  Serial.printf("VAD Avg: %ld\n", avg); // <--- Thêm dòng này để xem số thực tế
-  return avg > VAD_THRESHOLD; 
+    sum += abs(audio_buf[i]);
+  return (sum / AUDIO_SAMPLES) > VAD_THRESHOLD;
 }
 
-// ════════════════════════════════════════════════════════════
-// OLED
-// ════════════════════════════════════════════════════════════
-void oled_ready() {
-    if (!oled_ok) return;
-    display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
-    display.setTextSize(1);
-    display.setCursor(0,0);  display.println("KWS RLIF  Ready");
-    display.setCursor(0,14); display.println("Say: on / off");
-    display.setCursor(0,24); display.println("     left / right");
-    display.setCursor(0,44); display.println("Listening...");
-    display.display();
-}
-void oled_processing() {
-    if (!oled_ok) return;
-    display.clearDisplay(); display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0,20); display.println("  Processing...");
-    display.display();
-}
-void oled_result(int kw_idx, float conf) {
-    if (!oled_ok) return;
-    display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
-    display.setTextSize(3);
-    const char* kw = KWS_LABELS[kw_idx];
-    int16_t x1,y1; uint16_t tw,th;
-    display.getTextBounds(kw,0,0,&x1,&y1,&tw,&th);
-    display.setCursor((OLED_W-tw)/2,4); display.print(kw);
-    display.setTextSize(1); display.setCursor(0,42);
-    display.printf("conf: %d%%",(int)(conf*100));
-    display.fillRect(0,54,(int)(conf*OLED_W),8,SSD1306_WHITE);
-    display.display();
-}
-void oled_unknown() {
-    if (!oled_ok) return;
-    display.clearDisplay(); display.setTextSize(2);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(20,20); display.println("???");
-    display.display();
+// ── LED actions ─────────────────────────────────────────────
+bool led_on_state    = false;
+bool led_left_state  = false;
+bool led_right_state = false;
+bool led_go_state    = false;
+
+void blink_led(int pin, int times = 3) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(pin, HIGH); delay(100);
+    digitalWrite(pin, LOW);  delay(100);
+  }
 }
 
-// ════════════════════════════════════════════════════════════
-// Keyword handler
-// ════════════════════════════════════════════════════════════
 void handle_keyword(int kw_idx) {
-    const char* kw = KWS_LABELS[kw_idx];
-    float total=0;
-    for (int k=0;k<KWS_NUM_CLASSES;k++) if(mem2_sum[k]>0) total+=mem2_sum[k];
-    float conf = (total>0) ? mem2_sum[kw_idx]/total : 0;
+  String kw = KWS_LABELS[kw_idx];
+  Serial.printf(">>> Keyword: %s (spikes: ", kw.c_str());
+  for (int k = 0; k < KWS_NUM_CLASSES; k++) Serial.printf("%.0f ", spike_count[k]);
+  Serial.println(")");
 
-    Serial.printf(">>> [%s]  conf=%d%%\n", kw, (int)(conf*100));
+  if      (kw == "on")    { led_on_state = true;  digitalWrite(LED_ON, HIGH); }
+  else if (kw == "off")   { led_on_state = false; digitalWrite(LED_ON, LOW);  }
+  else if (kw == "left")  { led_left_state = !led_left_state;  digitalWrite(LED_LEFT,  led_left_state  ? HIGH : LOW); }
+  else if (kw == "right") { led_right_state = !led_right_state; digitalWrite(LED_RIGHT, led_right_state ? HIGH : LOW); }
+  else if (kw == "go")    { led_go_state = true;  digitalWrite(LED_GO, HIGH); }
+  else if (kw == "stop")  {
+    // Tắt tất cả
+    led_on_state = led_left_state = led_right_state = led_go_state = false;
+    digitalWrite(LED_ON, LOW); digitalWrite(LED_LEFT, LOW);
+    digitalWrite(LED_RIGHT, LOW); digitalWrite(LED_GO, LOW);
+    blink_led(LED_GO, 2);
+  }
 
-    if      (strcmp(kw,"on")   ==0) { led_on_state=true;  digitalWrite(PIN_LED_ON,HIGH); }
-    else if (strcmp(kw,"off")  ==0) { led_on_state=false; digitalWrite(PIN_LED_ON,LOW);  }
-    else if (strcmp(kw,"left") ==0) { led_left_state=!led_left_state;   digitalWrite(PIN_LED_LEFT, led_left_state ?HIGH:LOW); }
-    else if (strcmp(kw,"right")==0) { led_right_state=!led_right_state; digitalWrite(PIN_LED_RIGHT,led_right_state?HIGH:LOW); }
-
-    oled_result(kw_idx, conf);
+#ifdef USE_OLED
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 20);
+  display.println(kw);
+  float conf = spike_count[kw_idx] / KWS_TIME_STEPS * 100;
+  display.setTextSize(1);
+  display.setCursor(10, 50);
+  display.printf("conf: %.0f%%", conf);
+  display.display();
+#endif
 }
 
-// ════════════════════════════════════════════════════════════
-// I2S
-// ════════════════════════════════════════════════════════════
+// I2S setup 
 void setup_i2s() {
-    i2s_config_t cfg = {
-        .mode                 = (i2s_mode_t)(I2S_MODE_MASTER|I2S_MODE_RX),
-        .sample_rate          = SAMPLE_RATE,
-        .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
-        .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count        = 4,
-        .dma_buf_len          = 512,
-        .use_apll             = false,
-    };
-    i2s_pin_config_t pins = {
-        .bck_io_num   = PIN_I2S_SCK,
-        .ws_io_num    = PIN_I2S_WS,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num  = PIN_I2S_SD,
-    };
-    i2s_driver_install(I2S_NUM_0,&cfg,0,NULL);
-    i2s_set_pin(I2S_NUM_0,&pins);
-    i2s_zero_dma_buffer(I2S_NUM_0);
+  i2s_config_t cfg = {
+    .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate          = SAMPLE_RATE,
+    .bits_per_sample      = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 4,
+    .dma_buf_len          = 512,
+    .use_apll             = false,
+    .tx_desc_auto_clear   = false,
+    .fixed_mclk           = 0
+  };
+  i2s_pin_config_t pins = {
+    .bck_io_num   = I2S_SCK,
+    .ws_io_num    = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num  = I2S_SD
+  };
+  i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pins);
+  i2s_zero_dma_buffer(I2S_NUM_0);
 }
 
 void read_audio() {
-    static int32_t tmp[512]; size_t br; int got=0;
-    while (got<AUDIO_SAMPLES) {
-        int n=min(512,AUDIO_SAMPLES-got);
-        i2s_read(I2S_NUM_0,tmp,n*sizeof(int32_t),&br,portMAX_DELAY);
-        int rn=br/sizeof(int32_t);
-        for(int i=0;i<rn&&got<AUDIO_SAMPLES;i++,got++) audio_buf[got]=(int16_t)(tmp[i]>>16);
-    }
+  int32_t raw[512];
+  size_t bytes_read;
+  int samples_read = 0;
+  while (samples_read < AUDIO_SAMPLES) {
+    int to_read = min(512, AUDIO_SAMPLES - samples_read);
+    i2s_read(I2S_NUM_0, raw, to_read * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+    int got = bytes_read / sizeof(int32_t);
+    for (int i = 0; i < got && samples_read < AUDIO_SAMPLES; i++, samples_read++)
+      audio_buf[samples_read] = (int16_t)(raw[i] >> 16);
+  }
 }
 
-// ════════════════════════════════════════════════════════════
-// Setup & Loop
-// ════════════════════════════════════════════════════════════
+//Setup & Loop
 void setup() {
-    Serial.begin(115200); delay(200);
-    Serial.println("\n=== KWS RLIF ESP32 ===");
-    Serial.printf("Classes=%d  T=%d  Flatten=%d\n", KWS_NUM_CLASSES, KWS_TIME_STEPS, KWS_FLATTEN_SIZE);
+  Serial.begin(115200);
+  Serial.println("KWS SNN ESP32 starting...");
 
-    pinMode(PIN_LED_ON,   OUTPUT); digitalWrite(PIN_LED_ON,  LOW);
-    pinMode(PIN_LED_LEFT, OUTPUT); digitalWrite(PIN_LED_LEFT,LOW);
-    pinMode(PIN_LED_RIGHT,OUTPUT); digitalWrite(PIN_LED_RIGHT,LOW);
+  pinMode(LED_ON,    OUTPUT); digitalWrite(LED_ON,    LOW);
+  pinMode(LED_LEFT,  OUTPUT); digitalWrite(LED_LEFT,  LOW);
+  pinMode(LED_RIGHT, OUTPUT); digitalWrite(LED_RIGHT, LOW);
+  pinMode(LED_GO,    OUTPUT); digitalWrite(LED_GO,    LOW);
 
-    Wire.begin(21,22);
-    oled_ok = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-    if (oled_ok) { display.clearDisplay(); display.display(); Serial.println("OLED OK"); }
-    else           Serial.println("OLED not found");
+  setup_i2s();
 
-    setup_i2s();
+#ifdef USE_OLED
+  Wire.begin(21, 22);
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("KWS SNN Ready");
+    display.println("Say: on/off/left");
+    display.println("     right/go/stop");
+    display.display();
+  }
+#endif
 
-    for (int p : {PIN_LED_ON,PIN_LED_LEFT,PIN_LED_RIGHT}) { digitalWrite(p,HIGH); delay(100); }
-    delay(200);
-    for (int p : {PIN_LED_ON,PIN_LED_LEFT,PIN_LED_RIGHT}) digitalWrite(p,LOW);
+  srand(42);
 
-    Serial.printf("Free heap: %d bytes\n",(int)ESP.getFreeHeap());
-    oled_ready();
-    Serial.println("Ready. Listening...");
+  // Startup blink
+  for (int p : {LED_ON, LED_LEFT, LED_RIGHT, LED_GO}) {
+    digitalWrite(p, HIGH); delay(100);
+  }
+  delay(200);
+  for (int p : {LED_ON, LED_LEFT, LED_RIGHT, LED_GO}) {
+    digitalWrite(p, LOW);
+  }
+
+  Serial.println("Ready! Listening...");
 }
 
-static unsigned long last_kw_ms = 0;
+unsigned long last_kw_time = 0;
 
 void loop() {
-    read_audio();
-    if (!vad_detected()) {
-        static unsigned long last_idle=0;
-        if (millis()-last_idle>8000) { Serial.println("... (silence)"); last_idle=millis(); }
-        return;
-    }
-    Serial.println("Speech detected!");
-    oled_processing();
+  read_audio();
 
-    unsigned long t0=millis();
-    compute_log_mel();
-    run_cnn_features();
-    int kw=run_rlif_inference();
-    Serial.printf("Inference: %lu ms\n", millis()-t0);
+  if (!vad_detected()) {
+    Serial.println("... (silence)");
+    return;
+  }
 
-    if (kw>=0) {
-        unsigned long now=millis();
-        if (now-last_kw_ms>DEBOUNCE_MS) { handle_keyword(kw); last_kw_ms=now; }
-        else Serial.println("(debounce skip)");
-    } else {
-        Serial.println("(unknown / low conf)");
-        oled_unknown(); delay(600); oled_ready();
+  Serial.println("Speech detected! Running inference...");
+  unsigned long t0 = millis();
+
+  compute_log_mel();
+  int kw = run_snn_inference();
+
+  unsigned long elapsed = millis() - t0;
+  Serial.printf("Inference time: %lu ms\n", elapsed);
+
+  if (kw >= 0) {
+    unsigned long now = millis();
+    if (now - last_kw_time > DEBOUNCE_MS) {
+      handle_keyword(kw);
+      last_kw_time = now;
     }
+  } else {
+    Serial.println("(không nhận ra keyword)");
+  }
 }

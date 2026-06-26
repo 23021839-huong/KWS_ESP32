@@ -6,11 +6,11 @@ from collections import Counter, defaultdict
 from config_tiny import Config
 
 
-# ── Ngưỡng lọc chất lượng ────────────────────────────────────
-_MIN_RMS        = 0.002   # loại file gần như trống
-_MAX_CLIP_RATIO = 0.01    # loại nếu > 1% sample bị clipping
+# Ngưỡng lọc chất lượng
+_MIN_RMS        = 0.002   
+_MAX_CLIP_RATIO = 0.01    
 
-# Tất cả từ trong SpeechCommands v2, bỏ 4 keyword của ta
+# Tất cả từ trong SpeechCommands v2
 _UNKNOWN_WORDS = sorted({
     "backward", "bed", "bird", "cat", "dog", "down", "eight", "five",
     "follow",   "forward", "four", "go",   "happy", "house", "learn",
@@ -20,7 +20,7 @@ _UNKNOWN_WORDS = sorted({
 } - set(Config.KEYWORDS))
 
 
-# ── Helpers (dùng lại ở filter_dataset.py) ───────────────────
+# Helpers
 
 def quality_check(waveform, sr):
     """
@@ -60,17 +60,45 @@ def normalize_waveform(waveform, sr):
 
 
 def augment(waveform):
-    """Augmentation nhẹ, phù hợp môi trường trong nhà."""
-    # Gaussian noise
+    """
+    Augmentation cho môi trường trong nhà.
+    Thêm speed perturbation để giúp on/off phân biệt tốt hơn.
+    """
+    # 1. Gaussian noise nhẹ
     if torch.rand(1) < 0.5:
         waveform = waveform + torch.randn_like(waveform) * 0.003
-    # Time shift ±125ms
+
+    # 2. Time shift ±125ms
     if torch.rand(1) < 0.5:
         shift = int(torch.randint(-2000, 2000, (1,)))
         waveform = torch.roll(waveform, shifts=shift, dims=1)
-    # Volume ×0.7–1.3
+
+    # 3. Volume ×0.7–1.3
     if torch.rand(1) < 0.4:
         waveform = waveform * (0.7 + torch.rand(1).item() * 0.6)
+
+    # 4. Speed perturbation ×0.9–1.1 (resample trick)
+    #    Giúp on/off không bị nhầm do tốc độ nói khác nhau
+    if torch.rand(1) < 0.4:
+        speed = 0.9 + torch.rand(1).item() * 0.2   # [0.9, 1.1]
+        orig_len = waveform.size(1)
+        new_len  = int(orig_len / speed)
+        # Resample về new_len rồi crop/pad về orig_len
+        waveform = torch.nn.functional.interpolate(
+            waveform.unsqueeze(0), size=new_len, mode="linear", align_corners=False
+        ).squeeze(0)
+        if waveform.size(1) > orig_len:
+            waveform = waveform[:, :orig_len]
+        elif waveform.size(1) < orig_len:
+            waveform = torch.nn.functional.pad(waveform, (0, orig_len - waveform.size(1)))
+
+    # 5. Frequency masking nhẹ trên raw waveform (band-stop ngẫu nhiên)
+    #    Tăng robustness với giọng khác nhau
+    if torch.rand(1) < 0.3:
+        mask_start = int(torch.randint(0, 12000, (1,)))
+        mask_len   = int(torch.randint(500, 2000, (1,)))
+        waveform[:, mask_start:mask_start+mask_len] *= 0.1
+
     return waveform
 
 
@@ -102,7 +130,7 @@ class KWSDataset(Dataset):
         skipped      = Counter()
         unk_pool     = defaultdict(list)
 
-        # ── Pass 1: keyword chính + gom unknown pool ─────────
+        # Pass 1: keyword chính + gom unknown pool
         for waveform, sr, label, *_ in raw:
 
             if label in self.label_to_idx and label != "unknown":
@@ -119,7 +147,7 @@ class KWSDataset(Dataset):
                     if ok:
                         unk_pool[label].append((waveform, sr))
 
-        # ── Pass 2: chọn unknown cân bằng từ pool ────────────
+        # Pass 2: chọn unknown cân bằng từ pool
         n_keyword     = len(self.samples)
         n_unk_words   = len(unk_pool)
         if n_unk_words > 0:
@@ -131,7 +159,7 @@ class KWSDataset(Dataset):
                     self.samples.append(normalize_waveform(waveform, sr))
                     self.labels.append(unknown_idx)
 
-        # ── Thống kê ─────────────────────────────────────────
+        # Thống kê
         count   = Counter(self.labels)
         n_total = len(self.samples)
         n_bad   = sum(skipped.values())
