@@ -6,7 +6,7 @@ Pipeline :
     → MelSpectrogram → squeeze → log → crop/pad → normalize(mean/std)
     → log_mel (B, MAX_LEN, N_MELS)
     → model.forward(mel):
-        CNN 1 lần → feat (B, FLATTEN_SIZE)
+        CNN → feat (B, FLATTEN_SIZE)
         normalize [0,1] → direct encode → RLIF loop (recurrent) → mean membrane
     → logits (B, NUM_CLASSES) → CrossEntropyLoss
 """
@@ -22,7 +22,7 @@ from dataset_tiny import KWSDataset
 from model_tiny   import KWS_SNN_Tiny
 
 
-# ── Mel transform — phải khớp compute_log_mel() firmware ────
+#Mel transform — phải khớp compute_log_mel() firmware
 mel_transform = torchaudio.transforms.MelSpectrogram(
     sample_rate = Config.SAMPLE_RATE,
     n_fft       = Config.N_FFT,

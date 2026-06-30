@@ -6,35 +6,12 @@ from config_tiny import Config
 
 
 class KWS_SNN_Tiny(nn.Module):
-    """
-    Hybrid CNN + RLIF (Recurrent LIF) cho KWS trên ESP32.
-
-    Pipeline:
-      log-mel (B, MAX_LEN, N_MELS)
-        → CNN 1 lần → feat (B, FLATTEN_SIZE)      # feature ổn định
-        → normalize [0,1]                          # firing rate
-        → direct encode → repeat T lần            # deterministic, không random
-        → RLIF loop: FC1 → RLeaky1 → FC2 → RLeaky2
-        → sum membrane → logits
-
-    Tại sao RLIF tốt hơn LIF thuần cho audio:
-      - RLeaky thêm recurrent weight V: U[t+1] = β·U[t] + I[t] + V·S[t]
-      - Spike tại bước t ảnh hưởng đến bước t+1 → SNN nhớ được context
-      - "on" vs "off" khác nhau ở phoneme cuối → recurrent giúp phân biệt tốt hơn
-      - learn_beta=True + learn_threshold=True → tự điều chỉnh độ nhạy
-
-    Tại sao dùng direct encoding thay rate encoding:
-      - Rate encoding (Poisson): stochastic → gradient không ổn định
-      - Direct encoding: feat_norm làm input trực tiếp mỗi bước → deterministic
-      - Kết hợp với RLIF: SNN tự học temporal pattern từ sequence ổn định
-    """
 
     def __init__(self):
         super().__init__()
 
         spike_grad = surrogate.fast_sigmoid(slope=25)
 
-        # ── CNN — chạy 1 lần trên mel spectrogram ─────────────
         self.conv1 = nn.Conv2d(1, Config.CONV1_CH,
                                kernel_size=3, padding=1, bias=True)
         self.bn1   = nn.BatchNorm2d(Config.CONV1_CH)
@@ -53,11 +30,11 @@ class KWS_SNN_Tiny(nn.Module):
             f"FLATTEN_SIZE lệch: config={Config.FLATTEN_SIZE}, thực tế={computed}."
         )
 
-        # ── FC layers ──────────────────────────────────────────
+        # FC layers
         self.fc1 = nn.Linear(Config.FLATTEN_SIZE, Config.FC1_UNITS)
         self.fc2 = nn.Linear(Config.FC1_UNITS, Config.NUM_CLASSES)
 
-        # ── RLIF layers ────────────────────────────────────────
+        # RLIF layers 
         # all_to_all=True: recurrent weight là nn.Linear(FC1_UNITS, FC1_UNITS)
         # U[t+1] = β·U[t] + FC1(x[t]) + V·S[t]
         # learn_beta=True: β tự học
@@ -100,15 +77,7 @@ class KWS_SNN_Tiny(nn.Module):
         return x.reshape(x.size(0), -1)
 
     def forward(self, mel, time_steps=None):
-        """
-        mel       : (B, MAX_LEN, N_MELS) — log-mel đã normalize
-        time_steps: override Config.TIME_STEPS nếu cần
-        returns   : (B, NUM_CLASSES) — logits
 
-        Direct encoding: feat_norm được feed vào FC1 tại mỗi bước t
-        RLIF tích lũy membrane + recurrent spike qua T bước
-        → model học được temporal pattern trong sequence
-        """
         T = time_steps or Config.TIME_STEPS
 
         # 1. CNN feature — 1 lần, deterministic

@@ -62,13 +62,12 @@ def normalize_waveform(waveform, sr):
 def augment(waveform):
     """
     Augmentation cho môi trường trong nhà.
-    Thêm speed perturbation để giúp on/off phân biệt tốt hơn.
     """
     # 1. Gaussian noise nhẹ
     if torch.rand(1) < 0.5:
         waveform = waveform + torch.randn_like(waveform) * 0.003
 
-    # 2. Time shift ±125ms
+    # 2. Time shift 125ms
     if torch.rand(1) < 0.5:
         shift = int(torch.randint(-2000, 2000, (1,)))
         waveform = torch.roll(waveform, shifts=shift, dims=1)
@@ -109,8 +108,6 @@ class KWSDataset(Dataset):
     Load Google Speech Commands:
       - 4 keyword (on/off/left/right): lấy toàn bộ, lọc chất lượng
       - unknown: lấy đều từ các từ lạ, tổng ≈ số keyword để cân bằng
-      - WeightedRandomSampler cân bằng 5 class
-      - Augmentation chỉ lúc training
     """
 
     def __init__(self, subset="training", augment_data=True):

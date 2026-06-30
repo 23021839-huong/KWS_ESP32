@@ -26,12 +26,10 @@ class Config:
     NUM_CLASSES = len(ALL_LABELS)   # = 5
 
     # Số samples unknown tối đa lấy từ MỖI từ lạ trong dataset gốc
-    # ~29 từ × 80 = ~2320 unknown ≈ cân bằng với mỗi keyword (~2000–2500)
     UNKNOWN_PER_CLASS = 400
 
-    # ── Kiến trúc model ──────────────────────────────────────────
+    # Kiến trúc model
     # Giới hạn DRAM ESP32 (320 KB)
-    #
     # RAM tĩnh firmware ước tính:
     #   audio_buf (int16)  : 32  KB
     #   mel_buf (float)    : 10  KB
@@ -44,17 +42,17 @@ class Config:
     CONV2_CH  = 24
     FC1_UNITS = 96
 
-    # ── SNN ──────────────────────────────────────────────────────
+    # SNN
     TIME_STEPS = 64   
     BETA       = 0.90
 
-    # ── Training ─────────────────────────────────────────────────
+    # Training
     BATCH_SIZE   = 64
     LR           = 2e-3
     EPOCHS       = 100
     WEIGHT_DECAY = 1e-4
 
-    # ── Flatten size 
-    FLATTEN_H    = MAX_LEN // 4                        # = 16
-    FLATTEN_W    = N_MELS  // 4                        # = 10
+    # Flatten size 
+    FLATTEN_H    = MAX_LEN // 4                        
+    FLATTEN_W    = N_MELS  // 4                        
     FLATTEN_SIZE = FLATTEN_H * FLATTEN_W * CONV2_CH   # = 16×10×24 = 3840

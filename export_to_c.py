@@ -1,10 +1,7 @@
 """
 export_to_c.py
 
-Chạy sau train_tiny.py:
-    python export_to_c.py
-
-Output: model_weights.h — copy vào thư mục sketch Arduino
+Output: model_weights.h 
 
 RLIF thêm các tensor so với LIF thường:
   rlif1.recurrent.weight  : (FC1_UNITS, FC1_UNITS) — V trong U[t+1]=βU[t]+I[t]+V·S[t]
