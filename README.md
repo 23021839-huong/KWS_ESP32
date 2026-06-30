@@ -152,14 +152,12 @@ Một số hạn chế hiện tại:
 * Mô hình vẫn cần tối ưu thêm về kích thước và thời gian suy luận.
 * Chưa đánh giá đầy đủ về độ trễ (Latency), năng lượng tiêu thụ và độ ổn định trong nhiều môi trường khác nhau.
 * Chưa triển khai các kỹ thuật tối ưu như Pruning hoặc Knowledge Distillation.
-* Chưa hỗ trợ cập nhật mô hình trực tiếp trên thiết bị.
 
 ---
 
 # Future Work
 
 Trong các phiên bản tiếp theo, dự án sẽ tập trung vào:
-
 * Tối ưu kiến trúc RLIF-CSNN.
 * Giảm kích thước mô hình để phù hợp hơn với ESP32.
 * Cải thiện Accuracy và Latency.
